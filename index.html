@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Swing Evaluator</title>
+<style>
+  :root{--bg:#0f1419;--card:#1a212b;--ink:#e8edf2;--mute:#8a97a6;--acc:#3ddc97;--hip:#4aa3ff;--sh:#ffb454;--bad:#ff6b6b;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.4 -apple-system,system-ui,sans-serif;padding:12px;padding-bottom:40px}
+  h1{font-size:20px;margin:4px 0 12px}
+  .card{background:var(--card);border-radius:12px;padding:12px;margin-bottom:12px}
+  button,.btn{background:var(--acc);color:#04210f;border:0;border-radius:10px;padding:12px 14px;font-weight:600;font-size:15px;cursor:pointer;display:inline-block}
+  button.sec,.btn.sec{background:#2a3441;color:var(--ink)}
+  button:disabled{opacity:.4}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .stage{position:relative;width:100%;background:#000;border-radius:10px;overflow:hidden}
+  video,canvas#ov{width:100%;display:block}
+  canvas#ov{position:absolute;inset:0;pointer-events:none}
+  input[type=range]{width:100%}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .m{background:#222b37;border-radius:10px;padding:10px}
+  .m b{display:block;font-size:20px}
+  .m span{color:var(--mute);font-size:12px}
+  .note{color:var(--mute);font-size:13px}
+  #status{color:var(--mute);font-size:13px;margin:6px 0}
+  canvas#chart{width:100%;height:170px;display:block}
+  .tag{display:inline-block;padding:2px 8px;border-radius:99px;font-size:12px;background:#2a3441;margin-right:4px}
+  .good{color:var(--acc)} .warn{color:var(--sh)} .bad{color:var(--bad)}
+  label{font-size:13px;color:var(--mute)}
+  select,textarea{background:#222b37;color:var(--ink);border:1px solid #2f3b4a;border-radius:8px;padding:8px;font-size:14px;width:100%}
+  ul{padding-left:18px;margin:6px 0}
+</style>
+</head>
+<body>
+<h1>Swing Evaluator <span style="font-size:12px;color:var(--mute)">v4</span></h1>
+
+<div class="card">
+  <div class="row">
+    <label class="btn" for="file">Load swing video</label>
+    <input id="file" type="file" accept="video/*" hidden>
+    <select id="hand" style="width:auto">
+      <option value="R">Right-handed hitter</option>
+      <option value="L">Left-handed hitter</option>
+    </select>
+    <button id="run" class="sec" disabled>Analyze</button>
+  </div>
+  <div id="status">Loading pose model…</div>
+  <div class="note">Tip: film at 60fps+ from the side (open-side view), full body in frame, camera on a tripod. Slow-mo video gives much better results.</div>
+</div>
+
+<div class="card">
+  <div class="stage"><video id="vid" playsinline muted controls preload="auto"></video><canvas id="ov"></canvas></div>
+  <input id="scrub" type="range" min="0" max="0" value="0" step="1" disabled>
+  <div class="row" style="margin-top:6px">
+    <button id="setContact" class="sec" disabled>Mark contact here</button>
+    <label><input type="checkbox" id="trail" checked> hand path</label>
+    <label><input type="checkbox" id="skel" checked> skeleton</label>
+  </div>
+</div>
+
+<div class="card">
+  <canvas id="chart"></canvas>
+  <div class="note"><span style="color:var(--hip)">■</span> hips &nbsp;<span style="color:var(--sh)">■</span> shoulders &nbsp;<span style="color:var(--acc)">■</span> separation (shoulders − hips, degrees)</div>
+</div>
+
+<div class="card">
+  <div class="grid" id="metrics"></div>
+  <ul id="feedback"></ul>
+</div>
+
+<div class="card">
+  <label>Coach notes</label>
+  <textarea id="notes" rows="3" placeholder="Notes on this swing…"></textarea>
+  <div class="row" style="margin-top:8px">
+    <button id="save" class="sec">Save to log</button>
+    <button id="export" class="sec">Export log (CSV)</button>
+  </div>
+  <div id="log" class="note" style="margin-top:8px"></div>
+</div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = id => document.getElementById(id);
+const vid = $("vid"), ov = $("ov"), octx = ov.getContext("2d");
+const work = document.createElement("canvas"), wctx = work.getContext("2d");
+let landmarker, frames = [], contactIdx = null, metrics = null;
+
+// ---------- load model ----------
+let modelErr = "";
+async function ensureModel() {
+  if (landmarker) return true;
+  const say = s => { $("status").textContent = s; };
+  const withTimeout = (p, ms, label) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(label + " timed out")), ms))]);
+  say("Loading pose engine…");
+  const fileset = await withTimeout(FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"), 30000, "Engine download");
+  const urls = [
+    ["lite", "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"],
+    ["full", "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task"]
+  ];
+  // CPU first: the GPU delegate can hang on iPhone Safari
+  for (const delegate of ["CPU", "GPU"]) {
+    for (const [name, modelAssetPath] of urls) {
+      try {
+        say(`Loading ${name} pose model (${delegate})…`);
+        landmarker = await withTimeout(PoseLandmarker.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath, delegate }, runningMode: "VIDEO", numPoses: 1
+        }), 45000, name + " model");
+        say("Model ready.");
+        return true;
+      } catch (e) { modelErr = String(e && e.message || e); }
+    }
+  }
+  return false;
+}
+ensureModel().then(ok => {
+  $("status").textContent = ok ? "Model ready. Load a swing video." : "Pose model not loaded yet (" + modelErr + "). Tap Analyze to retry.";
+}).catch(e => { modelErr = String(e && e.message || e); $("status").textContent = "Pose model not loaded yet (" + modelErr + "). Tap Analyze to retry."; });
+
+// ---------- load video ----------
+$("file").onchange = e => {
+  const f = e.target.files[0]; if (!f) return;
+  vid.src = URL.createObjectURL(f);
+  frames = []; contactIdx = null; metrics = null;
+  $("run").disabled = false;
+  $("status").textContent = "Video loaded. Tap Analyze.";
+  clearOut();
+};
+vid.onloadedmetadata = () => { ov.width = vid.videoWidth; ov.height = vid.videoHeight; };
+
+// ---------- analyze: step through video at fixed intervals ----------
+$("run").onclick = async () => {
+  let ok = false;
+  try { ok = await ensureModel(); } catch (e) { modelErr = String(e && e.message || e); }
+  if (!ok) {
+    $("status").textContent = "Pose model failed to load: " + modelErr + ". This usually means the page's network rules block the model download. Host this file on Glitch, GitHub Pages or Netlify and try again there.";
+    return;
+  }
+  if (!vid.duration || !isFinite(vid.duration)) { $("status").textContent = "Video not ready yet, try again in a second."; return; }
+  $("run").disabled = true; frames = [];
+  const dur = vid.duration, fps = 30, n = Math.floor(dur * fps);
+  vid.pause();
+  if (vid.readyState < 2) {
+    $("status").textContent = "Preparing video…";
+    try { await vid.play(); vid.pause(); } catch (e) {}
+    await new Promise(r => setTimeout(r, 300));
+  }
+  for (let i = 0; i < n; i++) {
+    const t = i / fps;
+    await seek(t);
+    let res = null;
+    try {
+      // downscale the frame first: full-size phone video is far too heavy for in-browser pose
+      const sc = Math.min(1, 480 / Math.max(vid.videoWidth, vid.videoHeight));
+      work.width = Math.round(vid.videoWidth * sc); work.height = Math.round(vid.videoHeight * sc);
+      wctx.drawImage(vid, 0, 0, work.width, work.height);
+      res = landmarker.detectForVideo(work, Math.round(t * 1000) + 1);
+    } catch (e) { modelErr = String(e && e.message || e); $("status").textContent = "Frame error: " + modelErr; }
+    if (res && res.landmarks.length) frames.push({ t, lm: res.landmarks[0], wl: res.worldLandmarks[0] });
+    else frames.push({ t, lm: null, wl: null });
+    $("status").textContent = `Analyzing… frame ${i + 1} of ${n} (${Math.round((i + 1) / n * 100)}%)`;
+    await new Promise(r => setTimeout(r, 0)); // let the UI update
+    if (i % 5 === 0) $("status").textContent = `Analyzing… ${Math.round(i / n * 100)}%`;
+  }
+  $("status").textContent = "Done.";
+  compute();
+  $("scrub").max = frames.length - 1; $("scrub").disabled = false;
+  $("setContact").disabled = false; $("run").disabled = false;
+  await show(contactIdx ?? 0);
+};
+const seek = t => new Promise(r => {
+  const target = Math.max(0.001, Math.min(t, vid.duration - 0.001));
+  if (Math.abs(vid.currentTime - target) < 0.0005 && vid.readyState >= 2) return r();
+  let done = false;
+  const fin = () => { if (done) return; done = true; vid.removeEventListener("seeked", fin); clearTimeout(tm); r(); };
+  const tm = setTimeout(fin, 2000); // never hang if the browser skips the event
+  vid.addEventListener("seeked", fin);
+  vid.currentTime = target;
+});
+
+// ---------- math ----------
+const L = { ls: 11, rs: 12, lw: 15, rw: 16, lh: 23, rh: 24 };
+const deg = r => r * 180 / Math.PI;
+// yaw of a left->right line in the horizontal (x,z) plane using 3D world landmarks
+const yaw = (a, b) => deg(Math.atan2(b.z - a.z, b.x - a.x));
+function unwrap(arr) {
+  const out = []; let off = 0, prev = null;
+  for (const v of arr) {
+    if (v == null) { out.push(null); continue; }
+    if (prev != null) { const d = v - prev; if (d > 180) off -= 360; else if (d < -180) off += 360; }
+    out.push(v + off); prev = v;
+  }
+  return out;
+}
+function smooth(a, k = 2) {
+  return a.map((_, i) => { let s = 0, c = 0; for (let j = -k; j <= k; j++) { const v = a[i + j]; if (v != null) { s += v; c++; } } return c ? s / c : null; });
+}
+
+function compute() {
+  const hand = $("hand").value, sign = hand === "R" ? 1 : -1;
+  let hipY = frames.map(f => f.wl ? yaw(f.wl[L.lh], f.wl[L.rh]) : null);
+  let shY = frames.map(f => f.wl ? yaw(f.wl[L.ls], f.wl[L.rs]) : null);
+  hipY = smooth(unwrap(hipY)); shY = smooth(unwrap(shY));
+  // zero to first valid frame; flip so positive = rotating toward the pitcher for this batter
+  const h0 = hipY.find(v => v != null) ?? 0, s0 = shY.find(v => v != null) ?? 0;
+  hipY = hipY.map(v => v == null ? null : sign * (v - h0));
+  shY = shY.map(v => v == null ? null : sign * (v - s0));
+  const sep = hipY.map((h, i) => h == null || shY[i] == null ? null : shY[i] - h);
+
+  // hand position (image space, normalized) = midpoint of wrists
+  const hands = frames.map(f => f.lm ? { x: (f.lm[L.lw].x + f.lm[L.rw].x) / 2, y: (f.lm[L.lw].y + f.lm[L.rw].y) / 2 } : null);
+  const dt = 1 / 30;
+  const spd = hands.map((p, i) => {
+    const q = hands[i - 1]; if (!p || !q) return 0;
+    const dx = (p.x - q.x) * vid.videoWidth, dy = (p.y - q.y) * vid.videoHeight;
+    return Math.hypot(dx, dy) / dt; // px/s (relative; scale depends on framing)
+  });
+  const sSpd = smooth(spd, 1);
+  const peakHand = sSpd.reduce((b, v, i) => v > sSpd[b] ? i : b, 0);
+  if (contactIdx == null) contactIdx = peakHand;
+
+  const vel = a => a.map((v, i) => (v == null || a[i - 1] == null) ? 0 : (v - a[i - 1]) / dt);
+  const hv = smooth(vel(hipY)), sv = smooth(vel(shY));
+  const argmaxAbs = a => a.reduce((b, v, i) => Math.abs(v) > Math.abs(a[b]) ? i : b, 0);
+  const iHipPk = argmaxAbs(hv), iShPk = argmaxAbs(sv);
+  const iSepMax = sep.reduce((b, v, i) => v != null && (sep[b] == null || v > sep[b]) ? i : b, 0);
+
+  // hand path from launch (start of fast hand motion) to contact
+  let launch = contactIdx;
+  const thresh = sSpd[peakHand] * 0.15;
+  while (launch > 0 && sSpd[launch] > thresh) launch--;
+  let pathLen = 0;
+  for (let i = launch + 1; i <= contactIdx; i++) if (hands[i] && hands[i - 1]) pathLen += Math.hypot((hands[i].x - hands[i - 1].x) * vid.videoWidth, (hands[i].y - hands[i - 1].y) * vid.videoHeight);
+  const a = hands[launch], b = hands[contactIdx];
+  const straight = a && b ? Math.hypot((b.x - a.x) * vid.videoWidth, (b.y - a.y) * vid.videoHeight) : 0;
+  const efficiency = pathLen ? straight / pathLen : 0;
+
+  metrics = {
+    hipY, shY, sep, hands, launch,
+    maxSep: sep[iSepMax], tSep: frames[iSepMax].t,
+    hipPeak: Math.abs(hv[iHipPk]), shPeak: Math.abs(sv[iShPk]),
+    seqGap: (frames[iShPk].t - frames[iHipPk].t) * 1000,
+    handPeak: sSpd[peakHand], efficiency,
+    hipTotal: Math.max(...hipY.filter(v => v != null)) - Math.min(...hipY.filter(v => v != null)),
+    shTotal: Math.max(...shY.filter(v => v != null)) - Math.min(...shY.filter(v => v != null)),
+    lowConf: frames.filter(f => !f.lm).length
+  };
+  render();
+}
+
+// ---------- render ----------
+function render() {
+  const m = metrics; if (!m) return;
+  const cards = [
+    ["Max hip-shoulder separation", m.maxSep.toFixed(0) + "°", "typical good range ≈ 30–50°"],
+    ["Hip rotation range", m.hipTotal.toFixed(0) + "°", ""],
+    ["Shoulder rotation range", m.shTotal.toFixed(0) + "°", ""],
+    ["Peak hip speed", m.hipPeak.toFixed(0) + " °/s", ""],
+    ["Peak shoulder speed", m.shPeak.toFixed(0) + " °/s", ""],
+    ["Hips→shoulders peak gap", m.seqGap.toFixed(0) + " ms", "should be positive"],
+    ["Hand path efficiency", (m.efficiency * 100).toFixed(0) + "%", "straight ÷ actual, launch→contact"],
+    ["Contact frame", (frames[contactIdx].t).toFixed(2) + " s", "adjust with Mark contact"],
+  ];
+  $("metrics").innerHTML = cards.map(c => `<div class="m"><span>${c[0]}</span><b>${c[1]}</b><span>${c[2]}</span></div>`).join("");
+
+  const fb = [];
+  if (m.seqGap > 10) fb.push(`<span class="good">Good sequencing:</span> hips peak ~${m.seqGap.toFixed(0)} ms before the shoulders.`);
+  else fb.push(`<span class="bad">Sequencing:</span> shoulders are peaking with or before the hips. Work on leading with the lower half.`);
+  if (m.maxSep < 20) fb.push(`<span class="warn">Low separation (${m.maxSep.toFixed(0)}°):</span> hips and shoulders turn together, so you lose stored elastic energy. Try separation drills.`);
+  else if (m.maxSep > 55) fb.push(`<span class="warn">Very high separation:</span> check the video; may be tracking noise, or over-rotation that makes timing hard.`);
+  else fb.push(`<span class="good">Separation looks solid.</span>`);
+  if (m.efficiency < 0.6) fb.push(`<span class="warn">Hand path is looping (${(m.efficiency * 100).toFixed(0)}% efficient):</span> hands may be casting out or dropping. Compare with the path overlay.`);
+  else fb.push(`<span class="good">Direct hand path</span> to the ball.`);
+  if (m.lowConf > frames.length * 0.15) fb.push(`<span class="bad">Tracking missed ${m.lowConf} frames.</span> Re-film with better light and full body in view.`);
+  $("feedback").innerHTML = fb.map(x => `<li>${x}</li>`).join("");
+  drawChart();
+}
+
+function drawChart() {
+  const c = $("chart"), dpr = devicePixelRatio || 1;
+  c.width = c.clientWidth * dpr; c.height = c.clientHeight * dpr;
+  const g = c.getContext("2d"); g.scale(dpr, dpr);
+  const W = c.clientWidth, H = c.clientHeight, m = metrics;
+  g.clearRect(0, 0, W, H);
+  const all = [...m.hipY, ...m.shY, ...m.sep].filter(v => v != null);
+  const lo = Math.min(...all), hi = Math.max(...all), n = frames.length;
+  const X = i => 30 + (W - 40) * i / (n - 1), Y = v => H - 14 - (H - 28) * (v - lo) / (hi - lo || 1);
+  g.strokeStyle = "#2f3b4a"; g.beginPath(); g.moveTo(30, Y(0)); g.lineTo(W - 10, Y(0)); g.stroke();
+  g.fillStyle = "#8a97a6"; g.font = "10px sans-serif"; g.fillText(hi.toFixed(0) + "°", 0, 12); g.fillText(lo.toFixed(0) + "°", 0, H - 4);
+  const line = (a, col) => { g.strokeStyle = col; g.lineWidth = 2; g.beginPath(); let s = false; a.forEach((v, i) => { if (v == null) { s = false; return; } s ? g.lineTo(X(i), Y(v)) : g.moveTo(X(i), Y(v)); s = true; }); g.stroke(); };
+  line(m.hipY, "#4aa3ff"); line(m.shY, "#ffb454"); line(m.sep, "#3ddc97");
+  const mark = (i, col) => { g.strokeStyle = col; g.lineWidth = 1; g.setLineDash([4, 3]); g.beginPath(); g.moveTo(X(i), 0); g.lineTo(X(i), H); g.stroke(); g.setLineDash([]); };
+  mark(contactIdx, "#ff6b6b");
+  if (cur != null) mark(cur, "#ffffff55");
+}
+
+// ---------- overlay ----------
+let cur = null;
+const BONES = [[11, 12], [11, 13], [13, 15], [12, 14], [14, 16], [11, 23], [12, 24], [23, 24], [23, 25], [25, 27], [24, 26], [26, 28]];
+async function show(i) {
+  cur = i; await seek(frames[i].t);
+  octx.clearRect(0, 0, ov.width, ov.height);
+  const f = frames[i], w = ov.width, h = ov.height;
+  if ($("trail").checked && metrics) {
+    octx.strokeStyle = "#3ddc97"; octx.lineWidth = Math.max(3, w / 200); octx.beginPath();
+    let s = false;
+    for (let k = metrics.launch; k <= Math.min(i, frames.length - 1); k++) {
+      const p = metrics.hands[k]; if (!p) continue;
+      s ? octx.lineTo(p.x * w, p.y * h) : octx.moveTo(p.x * w, p.y * h); s = true;
+    }
+    octx.stroke();
+  }
+  if ($("skel").checked && f.lm) {
+    octx.strokeStyle = "#ffffffcc"; octx.lineWidth = Math.max(2, w / 300);
+    for (const [a, b] of BONES) { octx.beginPath(); octx.moveTo(f.lm[a].x * w, f.lm[a].y * h); octx.lineTo(f.lm[b].x * w, f.lm[b].y * h); octx.stroke(); }
+    const line2 = (a, b, col) => { octx.strokeStyle = col; octx.lineWidth = Math.max(4, w / 160); octx.beginPath(); octx.moveTo(f.lm[a].x * w, f.lm[a].y * h); octx.lineTo(f.lm[b].x * w, f.lm[b].y * h); octx.stroke(); };
+    line2(23, 24, "#4aa3ff"); line2(11, 12, "#ffb454");
+  }
+  $("scrub").value = i;
+  if (metrics) drawChart();
+}
+$("scrub").oninput = e => show(+e.target.value);
+$("trail").onchange = $("skel").onchange = () => cur != null && show(cur);
+$("hand").onchange = () => frames.length && compute();
+$("setContact").onclick = () => { contactIdx = cur; compute(); show(cur); };
+
+function clearOut() { octx.clearRect(0, 0, ov.width, ov.height); $("metrics").innerHTML = ""; $("feedback").innerHTML = ""; }
+
+// ---------- log ----------
+const KEY = "swing-log-v1";
+const getLog = () => { try { return JSON.parse(localStorage.getItem(KEY) || "[]"); } catch { return []; } };
+function renderLog() { const l = getLog(); $("log").textContent = l.length ? `${l.length} swing(s) saved on this device.` : "No saved swings yet."; }
+$("save").onclick = () => {
+  if (!metrics) return;
+  const l = getLog();
+  l.push({ date: new Date().toISOString(), hand: $("hand").value, sep: metrics.maxSep.toFixed(1), hipPeak: metrics.hipPeak.toFixed(0), shPeak: metrics.shPeak.toFixed(0), gapMs: metrics.seqGap.toFixed(0), handEff: (metrics.efficiency * 100).toFixed(0), notes: $("notes").value.replace(/[\n,]/g, " ") });
+  try { localStorage.setItem(KEY, JSON.stringify(l)); } catch {}
+  renderLog();
+};
+$("export").onclick = () => {
+  const l = getLog(); if (!l.length) return;
+  const keys = Object.keys(l[0]);
+  const csv = [keys.join(","), ...l.map(r => keys.map(k => r[k]).join(","))].join("\n");
+  const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" })); a.download = "swing-log.csv"; a.click();
+};
+renderLog();
+</script>
+</body>
+</html>
